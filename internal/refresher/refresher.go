@@ -16,7 +16,14 @@ import (
 	"time"
 
 	"github.com/soroworks/sorovault/internal/registry"
+	"github.com/soroworks/sorovault/internal/stellar"
 	"github.com/soroworks/sorovault/internal/store"
+)
+
+const (
+	initialRateLimitBackoff = time.Second
+	maxRateLimitBackoff     = 16 * time.Second
+	maxRateLimitRetries     = 5
 )
 
 // Registry is the slice of *registry.Registry a sweep needs. It is an
@@ -183,6 +190,21 @@ func (r *Refresher) sweepAndLog(ctx context.Context) {
 // counted as a failure. Sweep only returns an error when it cannot work out
 // what to refresh.
 func (r *Refresher) Sweep(ctx context.Context) (Summary, error) {
+	return r.sweep(ctx, false)
+}
+
+// SweepAll refreshes every contract on the registry's network exactly once,
+// regardless of how recently it was refreshed. It is what the CLI's
+// `refresh --all` runs: one manual sweep, not a scheduled one.
+//
+// Unlike Sweep it does not pace refreshes across the interval, because a
+// command that waited an interval before finishing would be useless as a
+// cron job or an after-outage recovery step.
+func (r *Refresher) SweepAll(ctx context.Context) (Summary, error) {
+	return r.sweep(ctx, true)
+}
+
+func (r *Refresher) sweep(ctx context.Context, all bool) (Summary, error) {
 	var sum Summary
 
 	network, err := r.reg.Network(ctx)
@@ -190,7 +212,7 @@ func (r *Refresher) Sweep(ctx context.Context) (Summary, error) {
 		return sum, err
 	}
 
-	stale, err := r.staleContracts(ctx, network)
+	stale, err := r.staleContracts(ctx, network, all)
 	if err != nil {
 		return sum, err
 	}
@@ -204,11 +226,13 @@ func (r *Refresher) Sweep(ctx context.Context) (Summary, error) {
 	remainder := int64(r.interval % time.Duration(count))
 	var target time.Duration
 	var remainderProgress int64
+	rateLimitBackoff := initialRateLimitBackoff
+	rateLimitLogged := false
 	for i, contract := range stale {
 		if ctx.Err() != nil {
 			return sum, ctx.Err()
 		}
-		if i > 0 {
+		if !all && i > 0 {
 			target += step
 			remainderProgress += remainder
 			if remainderProgress >= count {
@@ -223,7 +247,41 @@ func (r *Refresher) Sweep(ctx context.Context) (Summary, error) {
 		}
 
 		sum.Checked++
-		result, err := r.refreshOne(ctx, contract.ContractID)
+		var result *registry.Result
+		var rateLimitRetries int
+		for {
+			result, err = r.refreshOne(ctx, contract.ContractID)
+			if !errors.Is(err, stellar.ErrRateLimited) {
+				break
+			}
+
+			if !rateLimitLogged {
+				r.log.WarnContext(ctx, "RPC rate-limited refresh sweep; backing off",
+					"contract_id", contract.ContractID, "network", network,
+					"delay", rateLimitBackoff, "error", err)
+				rateLimitLogged = true
+			} else {
+				r.log.DebugContext(ctx, "RPC still rate-limiting refresh sweep",
+					"contract_id", contract.ContractID, "network", network,
+					"delay", rateLimitBackoff)
+			}
+
+			if rateLimitRetries == maxRateLimitRetries {
+				sum.Failed++
+				return sum, nil
+			}
+			if err := r.wait(ctx, rateLimitBackoff); err != nil {
+				return sum, err
+			}
+			rateLimitRetries++
+			if rateLimitBackoff < maxRateLimitBackoff {
+				rateLimitBackoff *= 2
+				if rateLimitBackoff > maxRateLimitBackoff {
+					rateLimitBackoff = maxRateLimitBackoff
+				}
+			}
+		}
+		rateLimitBackoff = initialRateLimitBackoff
 		if err != nil {
 			// A busy registry is not a failure: the contract stays stale
 			// and the next sweep tries again. Failing it would report a
@@ -312,12 +370,12 @@ func (r *Refresher) refreshOne(ctx context.Context, id string) (*registry.Result
 	return r.reg.Refresh(ctx, id)
 }
 
-// staleContracts lists the contracts on network last refreshed before now
-// minus the interval.
+// staleContracts lists the contracts to refresh. Unless all is set, a
+// contract must have been last refreshed before now minus the interval.
 //
 // The whole record is kept, not just the ID: the sweep needs to know whether
 // a contract was already known to be missing before it refreshes it.
-func (r *Refresher) staleContracts(ctx context.Context, network string) ([]store.Contract, error) {
+func (r *Refresher) staleContracts(ctx context.Context, network string, all bool) ([]store.Contract, error) {
 	cutoff := r.now().Add(-r.interval)
 
 	var contracts []store.Contract
@@ -328,7 +386,7 @@ func (r *Refresher) staleContracts(ctx context.Context, network string) ([]store
 			return nil, fmt.Errorf("refresher: listing contracts: %w", err)
 		}
 		for _, c := range page.Contracts {
-			if c.LastRefreshed.Before(cutoff) {
+			if all || c.LastRefreshed.Before(cutoff) {
 				contracts = append(contracts, c)
 			}
 		}

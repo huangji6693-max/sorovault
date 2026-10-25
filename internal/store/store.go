@@ -1,10 +1,10 @@
 // Package store persists the contract registry.
 //
-// The registry keeps two things per contract: a row tracking which WASM the
-// contract currently runs, and one immutable spec row per WASM hash it has
-// ever run. Refreshing a contract therefore appends a version rather than
-// overwriting one, so an interface that was live at some point stays
-// retrievable after the contract is upgraded.
+// The registry keeps two things per contract: a row tracking its current
+// interface version identifier, and one immutable spec row per identifier it
+// has ever used. Uploaded contracts use their WASM hash; protocol-provided
+// contracts such as SACs use a stable built-in identifier. Refreshing a
+// contract therefore appends a version rather than overwriting one.
 package store
 
 import (
@@ -19,6 +19,37 @@ import (
 // ErrNotFound is returned when a lookup matches no row.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrRegistryNotEmpty is returned by Import when it is asked to load into a
+// registry that already holds contracts and merge was not requested.
+var ErrRegistryNotEmpty = errors.New("store: registry is not empty")
+
+// SnapshotVersion is the on-disk format version of a Snapshot. Reading a
+// snapshot with any other version is refused rather than guessed at.
+const SnapshotVersion = 1
+
+// Snapshot is a complete, portable copy of the registry: every contract and
+// every interface version it has stored, with the timestamps that make the
+// version history meaningful.
+type Snapshot struct {
+	Version   int                `json:"version"`
+	Contracts []ContractSnapshot `json:"contracts"`
+}
+
+// ContractSnapshot is one contract together with its version history.
+type ContractSnapshot struct {
+	Contract Contract       `json:"contract"`
+	Versions []SpecSnapshot `json:"versions"`
+}
+
+// SpecSnapshot is one stored interface version. The row ID and the search
+// symbols are deliberately absent: they are storage details that both
+// implementations can rebuild.
+type SpecSnapshot struct {
+	WasmHash  string           `json:"wasm_hash"`
+	Interface *model.Interface `json:"interface"`
+	DecodedAt time.Time        `json:"decoded_at"`
+}
+
 // Contract is a registered contract's current state.
 type Contract struct {
 	ContractID      string    `json:"contract_id"`
@@ -29,12 +60,18 @@ type Contract struct {
 	SourceCommit    string    `json:"source_commit,omitempty"`
 	FirstSeen       time.Time `json:"first_seen"`
 	LastRefreshed   time.Time `json:"last_refreshed"`
+	// ObservedLedger is only passed to Save for a newly observed version.
+	ObservedLedger *uint32 `json:"-"`
 
 	// MissingSince is when a refresh first found the contract absent from
 	// the network. It is nil while the contract is live, and is cleared by
 	// the next save, which only happens once the contract has been fetched
 	// again.
 	MissingSince *time.Time `json:"missing_since,omitempty"`
+
+	// Implements lists the standard interface IDs detected from the current
+	// decoded interface, such as "sep41".
+	Implements []string `json:"implements,omitempty"`
 
 	// Matches lists the interface symbols — functions, types, events — that
 	// a search query matched. It is only set on search results, and is
@@ -145,6 +182,8 @@ type Spec struct {
 	WasmHash   string           `json:"wasm_hash"`
 	Interface  *model.Interface `json:"interface"`
 	DecodedAt  time.Time        `json:"decoded_at"`
+	// ObservedLedger is the ledger at observation, not the upgrade ledger.
+	ObservedLedger *uint32 `json:"observed_ledger"`
 }
 
 // WasmSpec is a decoded interface for uploaded code that no registered
@@ -159,9 +198,13 @@ type WasmSpec struct {
 // SpecVersion summarises a stored spec without its body, for listing the
 // versions of a contract cheaply.
 type SpecVersion struct {
-	WasmHash  string    `json:"wasm_hash"`
-	DecodedAt time.Time `json:"decoded_at"`
-	Current   bool      `json:"current"`
+	WasmHash    string    `json:"wasm_hash,omitempty"`
+	InterfaceID string    `json:"interface_id,omitempty"`
+	Builtin     bool      `json:"builtin,omitempty"`
+	DecodedAt   time.Time `json:"decoded_at"`
+	Current     bool      `json:"current"`
+	// ObservedLedger is the ledger at observation, not the upgrade ledger.
+	ObservedLedger *uint32 `json:"observed_ledger"`
 }
 
 // ListFilter selects and pages a contract listing.
@@ -179,11 +222,25 @@ type ListFilter struct {
 	// Types restricts results to contracts whose current interface declares
 	// a user-defined type with exactly this name. Every name must match.
 	Types []string
+	// Implements restricts results to contracts implementing every listed standard ID.
+	Implements []string
 	// Limit is the maximum number of rows to return. Zero means
 	// DefaultLimit; anything above MaxLimit is clamped to MaxLimit.
 	Limit int
-	// Offset is the number of rows to skip.
+	// Offset is the number of rows to skip. Offset paging is kept for
+	// compatibility — it never breaks outright — but cursor paging below
+	// is what callers should reach for: offsets grow slower as the
+	// registry grows, and rows added while a client pages make offset
+	// pages repeat and skip each other. (The Go doc does not carry the
+	// formal Deprecated marker, because staticcheck then rejects the
+	// compatibility paths that still must honor it — the deprecation is
+	// voiced at the API surface instead.)
 	Offset int
+	// Cursor continues from where a previous page ended. An empty cursor
+	// starts from the top, so a first request carries none. A cursor and
+	// an offset are exclusive: ask for one page in one of the two ways.
+	// A cursor the store cannot read is ErrMalformedCursor.
+	Cursor string
 }
 
 // Paging bounds for ListFilter.
@@ -197,8 +254,14 @@ const (
 // straight from user input do not have to.
 func (f *ListFilter) Normalize() {
 	f.Query = strings.TrimSpace(f.Query)
+	// PostgreSQL text parameters cannot contain NUL or invalid UTF-8. Replace
+	// either with the Unicode replacement character so both stores search the
+	// same normalized query without rejecting arbitrary input.
+	f.Query = strings.ToValidUTF8(f.Query, "\uFFFD")
+	f.Query = strings.ReplaceAll(f.Query, "\x00", "\uFFFD")
 	f.Functions = cleanNames(f.Functions)
 	f.Types = cleanNames(f.Types)
+	f.Implements = cleanNames(f.Implements)
 	if f.Limit <= 0 {
 		f.Limit = DefaultLimit
 	}
@@ -224,11 +287,27 @@ func cleanNames(names []string) []string {
 	return out
 }
 
+func hasAllStandards(have, want []string) bool {
+	present := make(map[string]struct{}, len(have))
+	for _, id := range have {
+		present[id] = struct{}{}
+	}
+	for _, id := range want {
+		if _, ok := present[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // ContractPage is one page of a contract listing.
 type ContractPage struct {
 	Contracts []Contract `json:"contracts"`
 	// Total is how many contracts match the filter, ignoring paging.
 	Total int `json:"total"`
+	// Next carries the cursor of the following page when this page did
+	// not reach the end of the matches. Empty means the walk is over.
+	Next string `json:"next"`
 }
 
 // WasmFilter selects the contracts that run a given WASM hash.
@@ -360,6 +439,19 @@ type Store interface {
 	// UpdateSource attaches repository metadata to an existing contract.
 	UpdateSource(ctx context.Context, network, contractID, sourceURL, sourceCommit string) error
 
+	// Delete removes a contract and every interface version stored for it.
+	// It returns ErrNotFound when the contract is not in the registry.
+	Delete(ctx context.Context, network, contractID string) error
+
+	// Export returns every contract and every stored interface version,
+	// including their timestamps, for a portable registry backup.
+	Export(ctx context.Context) (*Snapshot, error)
+
+	// Import loads a snapshot. With merge false it requires an empty
+	// registry; with merge true it adds the contracts and versions that are
+	// missing and leaves existing records untouched.
+	Import(ctx context.Context, snapshot *Snapshot, merge bool) error
+
 	// SaveWasmSpec records an interface by network and WASM hash, independent
 	// of any deployed contract.
 	SaveWasmSpec(ctx context.Context, network, wasmHash string, iface *model.Interface) error
@@ -417,6 +509,10 @@ type Store interface {
 
 	// ListVersions returns every stored version of a contract, newest first.
 	ListVersions(ctx context.Context, network, contractID string) ([]SpecVersion, error)
+
+	// Ping reports whether the store's backing service answers. Readiness
+	// uses it; it must not change any stored data.
+	Ping(ctx context.Context) error
 
 	// Close releases any resources held by the store.
 	Close() error

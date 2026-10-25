@@ -17,6 +17,7 @@ import (
 	"github.com/soroworks/sorovault/internal/refresher"
 	"github.com/soroworks/sorovault/internal/registry"
 	"github.com/soroworks/sorovault/internal/spec"
+	"github.com/soroworks/sorovault/internal/stellar"
 	"github.com/soroworks/sorovault/internal/stellar/stellartest"
 	"github.com/soroworks/sorovault/internal/store"
 	"github.com/soroworks/sorovault/internal/wasm"
@@ -48,7 +49,7 @@ func (c *clock) Advance(d time.Duration) {
 func contractID(t *testing.T, n int) string {
 	t.Helper()
 	var raw [32]byte
-	raw[0], raw[1] = byte(n), byte(n>>8)
+	raw[0], raw[1] = byte(n), byte(n>>8) //nolint:gosec // n is a small test counter
 	id, err := strkey.Encode(strkey.VersionByteContract, raw[:])
 	require.NoError(t, err)
 	return id
@@ -221,6 +222,29 @@ func TestSweepSkipsRecentlyRefreshed(t *testing.T) {
 	assert.Equal(t, before, f.fake.Calls["WasmHash"], "a fresh contract must not cost an RPC call")
 }
 
+// TestSweepAllRefreshesRecentlyRefreshedContracts proves the manual sweep
+// ignores staleness: it is one pass over everything, for cron and recovery.
+func TestSweepAllRefreshesRecentlyRefreshedContracts(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	for i := 0; i < 3; i++ {
+		f.register(t, contractID(t, i), "hello")
+	}
+
+	before := f.fake.Calls["WasmHash"]
+	r := f.refresher(t)
+
+	sum, err := r.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, refresher.Summary{}, sum, "a scheduled sweep has nothing stale to do")
+
+	sum, err = r.SweepAll(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, refresher.Summary{Checked: 3}, sum)
+	assert.Equal(t, 3, f.fake.Calls["WasmHash"]-before,
+		"every contract must be checked even though it was just refreshed")
+}
+
 func TestSweepDetectsUpgrade(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -285,6 +309,71 @@ func TestSweepContinuesPastFailures(t *testing.T) {
 	sum, err := f.refresher(t).Sweep(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, refresher.Summary{Checked: 2, Changed: 1, Failed: 1}, sum)
+}
+
+type rateLimitRegistry struct {
+	refresher.Registry
+	remaining int
+}
+
+func (r *rateLimitRegistry) Refresh(ctx context.Context, contractID string) (*registry.Result, error) {
+	if r.remaining > 0 {
+		r.remaining--
+		return nil, stellar.ErrRateLimited
+	}
+	return r.Registry.Refresh(ctx, contractID)
+}
+
+func TestSweepBacksOffAndRetriesRateLimitedRefresh(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	id := contractID(t, 1)
+	f.register(t, id, "hello")
+	f.clock.Advance(interval + time.Minute)
+
+	reg := &rateLimitRegistry{Registry: f.reg, remaining: 2}
+	var waits []time.Duration
+	r, err := refresher.New(reg, refresher.Options{
+		Interval: interval,
+		Logger:   f.log,
+		Now:      f.clock.Now,
+		Wait: func(ctx context.Context, delay time.Duration) error {
+			waits = append(waits, delay)
+			return ctx.Err()
+		},
+	})
+	require.NoError(t, err)
+
+	sum, err := r.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, refresher.Summary{Checked: 1}, sum)
+	assert.Equal(t, []time.Duration{time.Second, 2 * time.Second}, waits)
+}
+
+func TestSweepStopsAfterRepeatedRateLimits(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	id := contractID(t, 1)
+	f.register(t, id, "hello")
+	f.clock.Advance(interval + time.Minute)
+
+	reg := &rateLimitRegistry{Registry: f.reg, remaining: 10}
+	var waits []time.Duration
+	r, err := refresher.New(reg, refresher.Options{
+		Interval: interval,
+		Logger:   f.log,
+		Now:      f.clock.Now,
+		Wait: func(ctx context.Context, delay time.Duration) error {
+			waits = append(waits, delay)
+			return ctx.Err()
+		},
+	})
+	require.NoError(t, err)
+
+	sum, err := r.Sweep(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, refresher.Summary{Checked: 1, Failed: 1}, sum)
+	assert.Equal(t, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}, waits)
 }
 
 // TestSweepCountsAMissingContractApart proves a contract that has gone from

@@ -65,6 +65,76 @@ func TestVersionsJSONShape(t *testing.T) {
 	assert.Equal(t, true, versions[0].(map[string]any)["current"])
 }
 
+func TestRefreshAllCommandArgs(t *testing.T) {
+	t.Parallel()
+
+	cmd := newRefreshCmd()
+	require.Error(t, cmd.Args(cmd, nil), "without --all a contract ID is required")
+	require.NoError(t, cmd.Args(cmd, []string{"a"}))
+
+	require.NoError(t, cmd.Flags().Set("all", "true"))
+	require.NoError(t, cmd.Args(cmd, nil), "--all needs no contract IDs")
+	require.Error(t, cmd.Args(cmd, []string{"a"}), "--all and contract IDs are mutually exclusive")
+	require.NotNil(t, cmd.Flags().Lookup("json"))
+}
+
+func TestCodegenZodNeedsTypeScript(t *testing.T) {
+	t.Parallel()
+
+	// The flag Matrix runs before anything touches the database, so a
+	// plain Execute proves the validation without wiring an app.
+	cmd := newCodegenCmd()
+	require.NotNil(t, cmd.Flags().Lookup("zod"))
+
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"CDABCDEF", "--lang", "md", "--zod"})
+	require.Error(t, cmd.Execute())
+	assert.Contains(t, buf.String(), "--zod generates TypeScript schemas")
+
+	cmd = newCodegenCmd()
+	cmd.SetArgs([]string{"CDABCDEF", "--zod", "--package"})
+	require.Error(t, cmd.Execute())
+}
+
+func TestConfirmed(t *testing.T) {
+	t.Parallel()
+
+	for _, answer := range []string{"y\n", "yes\n", " YES \n"} {
+		assert.True(t, confirmed(strings.NewReader(answer)), "answer %q", answer)
+	}
+	for _, answer := range []string{"n\n", "no\n", "\n", ""} {
+		assert.False(t, confirmed(strings.NewReader(answer)), "answer %q", answer)
+	}
+}
+
+func TestRemoveCommandFlags(t *testing.T) {
+	t.Parallel()
+
+	cmd := newRemoveCmd()
+	assert.NotNil(t, cmd.Flags().Lookup("network"))
+	assert.NotNil(t, cmd.Flags().Lookup("yes"))
+	require.Error(t, cmd.Args(cmd, nil))
+	require.Error(t, cmd.Args(cmd, []string{"a", "b"}))
+	require.NoError(t, cmd.Args(cmd, []string{"a"}))
+}
+
+func TestExportImportCommandFlags(t *testing.T) {
+	t.Parallel()
+
+	export := newExportCmd()
+	assert.NotNil(t, export.Flags().Lookup("output"))
+	require.NoError(t, export.Args(export, nil))
+	require.Error(t, export.Args(export, []string{"a", "b"}))
+
+	importCmd := newImportCmd()
+	assert.NotNil(t, importCmd.Flags().Lookup("input"))
+	assert.NotNil(t, importCmd.Flags().Lookup("merge"))
+	require.NoError(t, importCmd.Args(importCmd, nil))
+	require.Error(t, importCmd.Args(importCmd, []string{"a", "b"}))
+}
+
 func TestPackageDirName(t *testing.T) {
 	t.Parallel()
 

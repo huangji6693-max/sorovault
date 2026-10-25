@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/soroworks/sorovault/internal/model"
+	"github.com/soroworks/sorovault/internal/spec"
 )
 
 // Memory is an in-process Store.
@@ -49,6 +50,9 @@ func (m *Memory) SetClock(now func() time.Time) {
 	defer m.mu.Unlock()
 	m.now = now
 }
+
+// Ping satisfies Store. The memory store has no external service to ask.
+func (m *Memory) Ping(ctx context.Context) error { return ctx.Err() }
 
 // Close satisfies Store. There is nothing to release.
 func (m *Memory) Close() error { return nil }
@@ -138,6 +142,7 @@ func (m *Memory) Save(ctx context.Context, c Contract, iface *model.Interface) e
 	c.LastRefreshed = now
 	// A saved interface means the contract was live, so it is not missing
 	// any more.
+	c.Implements = spec.ImplementedStandards(iface)
 	c.MissingSince = nil
 	m.contracts[k] = c
 
@@ -150,12 +155,13 @@ func (m *Memory) Save(ctx context.Context, c Contract, iface *model.Interface) e
 
 	m.nextID++
 	m.specs[k] = append(m.specs[k], Spec{
-		ID:         m.nextID,
-		Network:    c.Network,
-		ContractID: c.ContractID,
-		WasmHash:   c.CurrentWasmHash,
-		Interface:  cloned,
-		DecodedAt:  now,
+		ID:             m.nextID,
+		Network:        c.Network,
+		ContractID:     c.ContractID,
+		WasmHash:       c.CurrentWasmHash,
+		Interface:      cloned,
+		DecodedAt:      now,
+		ObservedLedger: c.ObservedLedger,
 	})
 	return nil
 }
@@ -198,6 +204,157 @@ func (m *Memory) UpdateSource(ctx context.Context, network, contractID, sourceUR
 	c.SourceURL = sourceURL
 	c.SourceCommit = sourceCommit
 	m.contracts[k] = c
+	return nil
+}
+
+// Delete removes a contract and every interface version stored for it.
+func (m *Memory) Delete(ctx context.Context, network, contractID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := key(network, contractID)
+	if _, ok := m.contracts[k]; !ok {
+		return fmt.Errorf("%w: contract %s on %s", ErrNotFound, contractID, network)
+	}
+	delete(m.contracts, k)
+	delete(m.specs, k)
+	return nil
+}
+
+// Export returns a stable, deep copy of every contract and version.
+func (m *Memory) Export(ctx context.Context) (*Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	snapshot := &Snapshot{
+		Version:   SnapshotVersion,
+		Contracts: make([]ContractSnapshot, 0, len(m.contracts)),
+	}
+	for k, c := range m.contracts {
+		cs := ContractSnapshot{Contract: c}
+		cs.Contract.MissingSince = copyMissing(c.MissingSince)
+		cs.Contract.Matches = nil
+		for _, spec := range m.specs[k] {
+			cloned, err := cloneInterface(spec.Interface)
+			if err != nil {
+				return nil, err
+			}
+			cs.Versions = append(cs.Versions, SpecSnapshot{
+				WasmHash:  spec.WasmHash,
+				Interface: cloned,
+				DecodedAt: spec.DecodedAt,
+			})
+		}
+		sort.Slice(cs.Versions, func(i, j int) bool {
+			if !cs.Versions[i].DecodedAt.Equal(cs.Versions[j].DecodedAt) {
+				return cs.Versions[i].DecodedAt.Before(cs.Versions[j].DecodedAt)
+			}
+			return cs.Versions[i].WasmHash < cs.Versions[j].WasmHash
+		})
+		snapshot.Contracts = append(snapshot.Contracts, cs)
+	}
+
+	sort.Slice(snapshot.Contracts, func(i, j int) bool {
+		if snapshot.Contracts[i].Contract.Network != snapshot.Contracts[j].Contract.Network {
+			return snapshot.Contracts[i].Contract.Network < snapshot.Contracts[j].Contract.Network
+		}
+		return snapshot.Contracts[i].Contract.ContractID < snapshot.Contracts[j].Contract.ContractID
+	})
+	return snapshot, nil
+}
+
+// Import loads a snapshot into the memory store, preserving timestamps.
+func (m *Memory) Import(ctx context.Context, snapshot *Snapshot, merge bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateSnapshot(snapshot); err != nil {
+		return err
+	}
+
+	prepared := make([]ContractSnapshot, 0, len(snapshot.Contracts))
+	for _, cs := range snapshot.Contracts {
+		cs.Contract.MissingSince = copyMissing(cs.Contract.MissingSince)
+		cs.Contract.Matches = nil
+		for i := range cs.Versions {
+			cloned, err := cloneInterface(cs.Versions[i].Interface)
+			if err != nil {
+				return err
+			}
+			cs.Versions[i].Interface = cloned
+		}
+		prepared = append(prepared, cs)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !merge && len(m.contracts) > 0 {
+		return ErrRegistryNotEmpty
+	}
+
+	for _, cs := range prepared {
+		k := key(cs.Contract.Network, cs.Contract.ContractID)
+		if _, exists := m.contracts[k]; !exists {
+			m.contracts[k] = cs.Contract
+		}
+		for _, version := range cs.Versions {
+			if m.hasVersion(k, version.WasmHash) {
+				continue
+			}
+			m.nextID++
+			m.specs[k] = append(m.specs[k], Spec{
+				ID:         m.nextID,
+				Network:    cs.Contract.Network,
+				ContractID: cs.Contract.ContractID,
+				WasmHash:   version.WasmHash,
+				Interface:  version.Interface,
+				DecodedAt:  version.DecodedAt,
+			})
+		}
+	}
+	return nil
+}
+
+// hasVersion reports whether a contract already has a stored version for a
+// WASM hash. The caller holds m.mu.
+func (m *Memory) hasVersion(k, wasmHash string) bool {
+	for _, spec := range m.specs[k] {
+		if spec.WasmHash == wasmHash {
+			return true
+		}
+	}
+	return false
+}
+
+// validateSnapshot checks the parts of a snapshot that every store must
+// agree on before writing anything.
+func validateSnapshot(snapshot *Snapshot) error {
+	if snapshot == nil {
+		return errors.New("store: cannot import a nil snapshot")
+	}
+	if snapshot.Version != SnapshotVersion {
+		return fmt.Errorf("store: unsupported snapshot version %d (want %d)",
+			snapshot.Version, SnapshotVersion)
+	}
+	for _, cs := range snapshot.Contracts {
+		if cs.Contract.Network == "" || cs.Contract.ContractID == "" {
+			return errors.New("store: snapshot contains a contract without a network or contract ID")
+		}
+		for _, version := range cs.Versions {
+			if version.Interface == nil {
+				return fmt.Errorf("store: snapshot for %s has a version without an interface",
+					cs.Contract.ContractID)
+			}
+		}
+	}
 	return nil
 }
 
@@ -353,6 +510,17 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 		return nil, err
 	}
 	f.Normalize()
+	if f.Cursor != "" && f.Offset != 0 {
+		return nil, errors.New("store: a cursor and an offset are exclusive")
+	}
+	var cur listCursor
+	if f.Cursor != "" {
+		var err error
+		cur, err = decodeListCursor(f.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -361,6 +529,9 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 	needle := strings.ToLower(f.Query)
 	for k, c := range m.contracts {
 		if f.Network != "" && c.Network != f.Network {
+			continue
+		}
+		if len(f.Implements) > 0 && !hasAllStandards(c.Implements, f.Implements) {
 			continue
 		}
 		if needle != "" {
@@ -380,19 +551,47 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 		matched = append(matched, c)
 	}
 
-	sort.Slice(matched, func(i, j int) bool {
-		if !matched[i].LastRefreshed.Equal(matched[j].LastRefreshed) {
-			return matched[i].LastRefreshed.After(matched[j].LastRefreshed)
-		}
-		return matched[i].ContractID < matched[j].ContractID
-	})
+	sort.Slice(matched, func(i, j int) bool { return contractListBefore(matched[i], matched[j]) })
+
+	// A cursor pages by key: the next page starts at the first row that
+	// sorts strictly after the one the cursor names. The slice is already
+	// in listing order, so that is one binary search, not a scan.
+	start := 0
+	if cur.ContractID != "" {
+		start = sort.Search(len(matched), func(i int) bool {
+			return afterListCursor(matched[i], cur)
+		})
+	} else {
+		start = f.Offset
+	}
 
 	page := &ContractPage{Total: len(matched), Contracts: []Contract{}}
-	if f.Offset < len(matched) {
-		end := min(f.Offset+f.Limit, len(matched))
-		page.Contracts = append(page.Contracts, matched[f.Offset:end]...)
+	if start < len(matched) {
+		end := min(start+f.Limit, len(matched))
+		page.Contracts = append(page.Contracts, matched[start:end]...)
+		if end < len(matched) {
+			next, err := encodeListCursor(matched[end-1])
+			if err != nil {
+				return nil, err
+			}
+			page.Next = next
+		}
 	}
 	return page, nil
+}
+
+// contractListBefore is the listing's total order: last_refreshed
+// descending, then contract ID and network ascending. Sorting and cursor
+// paging share it, so a cursor walk and the order its pages arrive in are
+// the same thing rather than two conventions that agree by luck.
+func contractListBefore(a, b Contract) bool {
+	if !a.LastRefreshed.Equal(b.LastRefreshed) {
+		return a.LastRefreshed.After(b.LastRefreshed)
+	}
+	if a.ContractID != b.ContractID {
+		return a.ContractID < b.ContractID
+	}
+	return a.Network < b.Network
 }
 
 // ListContractsByWasm returns a paged listing of the contracts that run the
@@ -524,11 +723,14 @@ func (m *Memory) ListVersions(ctx context.Context, network, contractID string) (
 
 	versions := make([]SpecVersion, 0, len(m.specs[k]))
 	for _, s := range m.specs[k] {
-		versions = append(versions, SpecVersion{
-			WasmHash:  s.WasmHash,
-			DecodedAt: s.DecodedAt,
-			Current:   s.WasmHash == c.CurrentWasmHash,
-		})
+		v := SpecVersion{DecodedAt: s.DecodedAt, Current: s.WasmHash == c.CurrentWasmHash, ObservedLedger: s.ObservedLedger}
+		if s.WasmHash == model.StellarAssetContractIdentifier {
+			v.InterfaceID = s.WasmHash
+			v.Builtin = true
+		} else {
+			v.WasmHash = s.WasmHash
+		}
+		versions = append(versions, v)
 	}
 
 	sort.Slice(versions, func(i, j int) bool {
